@@ -76,6 +76,12 @@ public actor QEMUVirtualMachine {
         self.onReset = onReset
     }
     
+    /// Set or replace the reset handler
+    /// - Parameter handler: Closure to execute when the VM resets
+    public func setOnReset(_ handler: @escaping () -> Void) {
+        self.onReset = handler
+    }
+    
     /// Set the delegate to handle VM events
     /// - Parameter delegate: Delegate
     public func setDelegate(_ delegate: (any QEMUVirtualMachineDelegate)?) {
