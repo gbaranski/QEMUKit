@@ -32,7 +32,7 @@ public actor QEMUVirtualMachine {
         case starting
         /// VM is running.`
         case started
-        /// Recieved QMP event indicating VM is stopping.
+        /// Received QMP event indicating VM is stopping.
         case stopping
     }
     
@@ -54,6 +54,9 @@ public actor QEMUVirtualMachine {
     /// Delegate to handle VM events
     public weak var delegate: (any QEMUVirtualMachineDelegate)?
     
+    /// Handler executed on VM reset events
+    public var onReset: (() -> Void)?
+    
     /// For bridging delegate pattern to Swift Concurrency
     private lazy var coordinator: QEMUCoordinator = {
         QEMUCoordinator(for: self)
@@ -68,8 +71,9 @@ public actor QEMUVirtualMachine {
     /// Internal state of the virtual machine
     private var state: State = .stopped
     
-    public init() {
-        
+    /// Initialize VM. Optionally provide a reset handler.
+    public init(onReset: (() -> Void)? = nil) {
+        self.onReset = onReset
     }
     
     /// Set the delegate to handle VM events
@@ -87,15 +91,6 @@ public actor QEMUVirtualMachine {
     /// Start a new QEMU instance
     ///
     /// The caller provides a `launcher` and a `ui` which are used in the startup process.
-    /// The following are done in order:
-    ///   1. `launcher.startQemu()` is called which delegates the QEMU process startup.
-    ///   2. `interface.connect()` is called which delegates the UI connection attempt loop.
-    ///   3. When the UI interface is connected, `qemuInterface(:didCreateMonitorPort:)` is called.
-    ///   4. The callback will construct a `QEMUMonitor` and its delegate.
-    ///   5. The monitor will call `qemuQmpDidConnect()` which indicates a successful start.
-    /// - Parameters:
-    ///   - launcher: QEMU process launcher interface
-    ///   - interface: QEMU connection interface
     public func start(launcher: any QEMULauncher, interface: any QEMUInterface) async throws {
         guard state == .stopped else {
             throw QEMUError.operationNotAvailable
@@ -108,11 +103,8 @@ public actor QEMUVirtualMachine {
 #endif
         state = .starting
         defer {
-            // clean up the state if we failed to start
             if state == .starting {
                 state = .stopped
-                // potentially a race could set guestAgent
-                // other variables should not be set
                 guestAgent = nil
             }
         }
@@ -122,7 +114,7 @@ public actor QEMUVirtualMachine {
         let logging: QEMULogging
 #if os(macOS)
         logging = QEMULogging()
-#else // on iOS we do not have processes
+#else
         logging = QEMULogging.sharedInstance()
 #endif
         logging.delegate = coordinator
@@ -147,9 +139,7 @@ public actor QEMUVirtualMachine {
             }
         } onCancel: {
             interface.disconnect()
-            Task {
-                await interfaceConnectCancel()
-            }
+            Task { await interfaceConnectCancel() }
         }
         monitor.delegate = coordinator
         monitor.logging = logging
@@ -159,7 +149,6 @@ public actor QEMUVirtualMachine {
         await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 self.qmpConnectContinuation = continuation
-                // if we race and miss the didConnectQMP() event
                 if monitor.isConnected {
                     self.qmpConnectContinuation = nil
                     continuation.resume()
@@ -167,19 +156,14 @@ public actor QEMUVirtualMachine {
             }
         } onCancel: {
             monitor.delegate = nil
-            Task {
-                // fake the connection to trigger Task.checkCancellation() below
-                await didConnectQMP()
-            }
+            Task { await didConnectQMP() }
         }
 
-        // check if we had already terminated due to early error
         try Task.checkCancellation()
         guard monitor.isConnected else {
             throw QEMUError.terminatedUnexpectedly
         }
 
-        // enter command mode
         try await monitor.qmpEnterCommandMode()
         self.monitor = monitor
         self.launcher = launcher
@@ -190,51 +174,45 @@ public actor QEMUVirtualMachine {
     
     /// Stops a running instance of QEMU
     public func stop() async throws {
-        guard state != .stopped else {
-            return // nothing to do
-        }
-        guard state == .started else {
-            throw QEMUError.operationNotAvailable
-        }
+        guard state != .stopped else { return }
+        guard state == .started else { throw QEMUError.operationNotAvailable }
 #if DEBUG
         assert(monitor != nil)
 #endif
         do {
             try await monitor!.qemuQuit()
         } catch {
-            // if we're already stopped, ignore any errors
             if state != .stopped {
                 throw error
             }
         }
-
     }
     
-    /// Forceabily stop a running instance of QEMU
+    /// Forcefully stop a running instance of QEMU
     public func kill() {
-        guard state != .stopped else {
-            return // nothing to do
-        }
+        guard state != .stopped else { return }
         state = .stopped
-        // unregister delegates
         monitor?.delegate = nil
         launcher?.launcherDelegate = nil
         interface?.connectDelegate = nil
-        // stop process
         launcher?.stopQemu()
         interface?.disconnect()
         launcher?.logging?.endLog()
-        // cancel any RPC
         monitor?.cancel()
         guestAgent?.cancel()
-        // clear properties
         monitor = nil
         guestAgent = nil
         launcher = nil
         interface = nil
         delegate?.qemuVMDidStop(self)
     }
-    
+
+    /// Called internally on QEMU reset events
+    fileprivate func didReset() {
+        guard state == .started else { return }
+        onReset?()
+    }
+
     fileprivate func didConnectMonitor(_ monitor: QEMUMonitor) {
 #if DEBUG
         assert(state == .starting)
@@ -254,29 +232,20 @@ public actor QEMUVirtualMachine {
     }
     
     fileprivate func didConnectGuestAgent(_ guestAgent: QEMUGuestAgent) {
-        guard state == .starting || state == .started else {
-            logger.info("Ignoring guest agent in state: \(state)")
-            return
-        }
+        guard state == .starting || state == .started else { return }
         self.guestAgent = guestAgent
         guestAgent.guestSetTime(NSDate.now.timeIntervalSince1970)
         guestAgent.logging = launcher?.logging
     }
     
     fileprivate func didError(_ error: Error) {
-        // special case when error comes during startup
         if !interfaceConnectRetry(on: error) {
             delegate?.qemuVM(self, didError: error)
         }
     }
     
-    /// Retry interface connection attempt
-    /// - Parameter error: Error that triggered the retry
-    /// - Returns: true if we are handling a connect attempt
     private func interfaceConnectRetry(on error: Error) -> Bool {
-        guard let attempt = interfaceConnectAttempt else {
-            return false
-        }
+        guard let attempt = interfaceConnectAttempt else { return false }
 #if DEBUG
         assert(state == .starting)
 #endif
@@ -299,12 +268,8 @@ public actor QEMUVirtualMachine {
         return true
     }
     
-    /// Cancel the interface connection attempt
     private func interfaceConnectCancel() -> Bool {
-        // if we were raced and the retry was successful
-        guard let attempt = interfaceConnectAttempt else {
-            return false
-        }
+        guard let attempt = interfaceConnectAttempt else { return false }
 #if DEBUG
         assert(state == .starting)
 #endif
@@ -314,9 +279,7 @@ public actor QEMUVirtualMachine {
         return true
     }
     
-    /// Called when QMP posts a "will quip" event
-    ///
-    /// If called while not started, this is an unexpected termination error.
+    /// Called when QMP posts a "will quit" event
     fileprivate func willStop() {
         guard state == .started else {
             didError(QEMUError.terminatedUnexpectedly)
@@ -327,8 +290,6 @@ public actor QEMUVirtualMachine {
     }
     
     /// Called when QEMU process has exited
-    ///
-    /// If QEMU is starting, ignore event, otherwise kill the service
     fileprivate func didStop() {
         if let _qmpConnectContinuation = qmpConnectContinuation {
             qmpConnectContinuation = nil
@@ -342,7 +303,7 @@ public actor QEMUVirtualMachine {
 
 // MARK: - Errors
 
-private enum QEMUError: Error {
+enum QEMUError: Error {
     case qemuError(String)
     case monitorError(String)
     case uiError(String)
@@ -386,15 +347,10 @@ extension QEMUCoordinator: QEMULauncherDelegate {
         logger.info("QEMU exited with code \(exitCode): \(message ?? "(no message)")")
         if exitCode != 0 {
             let unknown = NSLocalizedString("Unknown", comment: "QEMUVirtualMachine")
-            let message = message ?? String.localizedStringWithFormat(NSLocalizedString("QEMU exited from an error: %@", comment: "QEMUVirtualMachine"), lastErrorLine ?? unknown)
-            Task {
-                await operations.didError(QEMUError.qemuError(message))
-                await operations.didStop()
-            }
+            let msg = message ?? String.localizedStringWithFormat(NSLocalizedString("QEMU exited from an error: %@", comment: "QEMUVirtualMachine"), lastErrorLine ?? unknown)
+            Task { await operations.didError(QEMUError.qemuError(msg)); await operations.didStop() }
         } else {
-            Task {
-                await operations.didStop()
-            }
+            Task { await operations.didStop() }
         }
     }
 }
@@ -402,49 +358,38 @@ extension QEMUCoordinator: QEMULauncherDelegate {
 // MARK: - Monitor delegate
 
 extension QEMUCoordinator: QEMUMonitorDelegate {
-    func qemuHasWakeup(_ monitor: QEMUMonitor) {
-        logger.info("qemuHasWakeup")
-    }
+    func qemuHasWakeup(_ monitor: QEMUMonitor) { logger.info("qemuHasWakeup") }
     
     func qemuHasResumed(_ monitor: QEMUMonitor) {
         logger.info("qemuHasResumed")
-        Task {
-            try? await operations.guestAgent?.guestSetTime(NSDate.now.timeIntervalSince1970)
-        }
+        Task { try? await operations.guestAgent?.guestSetTime(NSDate.now.timeIntervalSince1970) }
     }
     
-    func qemuHasStopped(_ monitor: QEMUMonitor) {
-        logger.info("qemuHasStopped")
-    }
+    func qemuHasStopped(_ monitor: QEMUMonitor) { logger.info("qemuHasStopped") }
     
     func qemuHasReset(_ monitor: QEMUMonitor, guest: Bool) {
         logger.info("qemuHasReset")
+        Task {
+            try? await operations.guestAgent?.guestSetTime(NSDate.now.timeIntervalSince1970)
+            await operations.didReset()
+        }
     }
     
-    func qemuHasSuspended(_ monitor: QEMUMonitor) {
-        logger.info("qemuHasSuspended")
-    }
+    func qemuHasSuspended(_ monitor: QEMUMonitor) { logger.info("qemuHasSuspended") }
     
     func qemuWillQuit(_ monitor: QEMUMonitor, guest: Bool) {
         logger.info("qemuWillQuit")
-        Task {
-            await operations.willStop()
-        }
+        Task { await operations.willStop() }
     }
     
     func qemuError(_ monitor: QEMUMonitor, error: String) {
         logger.error("qemuError: \(error)")
-        Task {
-            await operations.didError(QEMUError.monitorError(error))
-        }
+        Task { await operations.didError(QEMUError.monitorError(error)) }
     }
     
-    // this is called right before we execute qmp_cont so we can setup additional option
     func qemuQmpDidConnect(_ monitor: QEMUMonitor) {
         logger.info("qemuQmpDidConnect")
-        Task {
-            await operations.didConnectQMP()
-        }
+        Task { await operations.didConnectQMP() }
     }
 }
 
@@ -453,25 +398,19 @@ extension QEMUCoordinator: QEMUMonitorDelegate {
 extension QEMUCoordinator: QEMUInterfaceConnectDelegate {
     func qemuInterface(_ qemuInterface: QEMUInterface, didErrorWithMessage message: String) {
         logger.error("UI Error: \(message)")
-        Task {
-            await operations.didError(QEMUError.uiError(message))
-        }
+        Task { await operations.didError(QEMUError.uiError(message)) }
     }
     
     func qemuInterface(_ qemuInterface: QEMUInterface, didCreateMonitorPort port: QEMUPort) {
         logger.info("Monitor port created")
         let monitor = QEMUMonitor(port: port)
-        Task {
-            await operations.didConnectMonitor(monitor)
-        }
+        Task { await operations.didConnectMonitor(monitor) }
     }
     
     func qemuInterface(_ qemuInterface: QEMUInterface, didCreateGuestAgentPort port: QEMUPort) {
         logger.info("Guest agent port created")
         let agent = QEMUGuestAgent(port: port)
-        Task {
-            await operations.didConnectGuestAgent(agent)
-        }
+        Task { await operations.didConnectGuestAgent(agent) }
     }
 }
 
@@ -500,9 +439,7 @@ extension QEMUCoordinator: QEMULoggingDelegate {
         success = success && scanner.scanString(")") != nil
         if scanner.isAtEnd && success {
             logger.info("Detected PTTY at '\(devpath!)' for device \(label!)")
-            Task {
-                await operations.delegate?.qemuVM(operations, didCreatePttyDevice: devpath!, label: label!)
-            }
+            Task { await operations.delegate?.qemuVM(operations, didCreatePttyDevice: devpath!, label: label!) }
         } else {
             logger.error("Cannot parse char device line: \(line)")
         }
